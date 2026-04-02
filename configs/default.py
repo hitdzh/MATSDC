@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 
 @dataclass
 class PipelineConfig:
-    """时序数据无监督样本挖掘 Pipeline 全局配置"""
+    """ Pipeline 全局配置"""
 
     # ==================== 数据参数 ====================
     dataset: str = 'dummy'            # 数据集名称
@@ -18,8 +18,16 @@ class PipelineConfig:
     # ==================== 模型参数 ====================
     y_hidden_dim: int = 256           # Y-PreEncoder 输出特征维度
     x_hidden_dim: int = 256           # X-Encoder 输出特征维度
-    lstm_layers: int = 4             # X-Encoder LSTM 层数
-    lstm_hidden_size: int = 256      # LSTM 隐状态维度
+
+    # X-Encoder PatchTST 参数 (Stage 3)
+    x_patch_len: int = 24            # patch 长度 (seq_len=336 → 27 patches)
+    x_stride: int = 12               # patch 步长 (50% 重叠)
+    x_d_model: int = 256             # Transformer 模型维度
+    x_n_heads: int = 8               # 注意力头数
+    x_e_layers: int = 4              # Transformer 编码器层数
+    x_d_ff: int = 1024               # 前馈网络维度
+    x_aggregation: str = 'flatten'   # 聚合策略: 'flatten' 保留全部 patch 信息
+    x_concat_rev_params: bool = True # 是否拼接 RevIN 统计参数
     
     # 以下为 Autoformer/Informer/Transformer 模型参数
     label_len: int = 336              # 解码器起始长度（通常等于 seq_len）
@@ -56,7 +64,9 @@ class PipelineConfig:
     batch_size: int = 32             # 批大小
     lr_encoder: float = 1e-3         # X-Encoder 学习率 (Adam)
     lr_centers: float = 0.5          # Center Loss 中心点学习率 (SGD)
-    center_loss_weight: float = 1.0  # Center Loss 权重 λ (联合 Loss: CE + λ * CenterLoss)
+    center_loss_weight: float = 1.0  # Center Loss 权重 λ₁ (联合 Loss: CE + λ₁ * CenterLoss + λ₂ * SupConLoss)
+    supcon_loss_weight: float = 0.1  # Supervised Contrastive Loss 权重 λ₂
+    supcon_temperature: float = 0.07 # SupCon 温度参数
 
     # ==================== Y-Encoder 预训练参数 ====================
     pretrain_epochs: int = 5         # Y-Encoder 预训练轮数

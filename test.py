@@ -23,6 +23,7 @@ from src.layers.PatchTSTEncoder import PatchTSTFeatureExtractor, create_patchtst
 from src.models.x_encoder import XEncoder
 from src.clustering.kcenter import generate_pseudo_labels
 from src.losses.center_loss import CenterLoss
+from src.losses.supcon_loss import SupervisedContrastiveLoss
 from src.trainers.metric_trainer import MetricTrainer
 from src.clustering.spectral_selector import SpectralSelector
 
@@ -106,13 +107,22 @@ def main():
     # ==================== 阶段 3：X 空间度量学习 ====================
     print("\n[Stage 3] X-Encoder Metric Learning Training")
 
-    # Build X-Encoder
+    # Build X-Encoder (PatchTST backbone)
     x_encoder = XEncoder(
         feature_dim=args.feature_dim,
         hidden_dim=args.x_hidden_dim,
-        lstm_hidden_size=args.lstm_hidden_size,
-        lstm_layers=args.lstm_layers,
         num_classes=args.K,
+        seq_len=args.seq_len,
+        patch_len=4,           # Small patch for short test sequences (seq_len=50)
+        stride=2,              # 50% overlap
+        d_model=args.x_hidden_dim,
+        n_heads=2,
+        e_layers=1,
+        d_ff=128,
+        dropout=0.1,
+        activation='gelu',
+        aggregation='max',     # Use max for small test sequences
+        concat_rev_params=True,
     )
 
     # Build Center Loss
@@ -121,13 +131,20 @@ def main():
         feat_dim=args.x_hidden_dim,
     )
 
+    # Build Supervised Contrastive Loss
+    supcon_loss = SupervisedContrastiveLoss(
+        temperature=args.supcon_temperature,
+    )
+
     # Build trainer and train
     trainer = MetricTrainer(
         encoder=x_encoder,
         center_loss=center_loss,
+        supcon_loss=supcon_loss,
         lr_encoder=args.lr_encoder,
         lr_centers=args.lr_centers,
         center_loss_weight=args.center_loss_weight,
+        supcon_loss_weight=args.supcon_loss_weight,
         device=device,
     )
 

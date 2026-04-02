@@ -32,6 +32,7 @@ from src.layers.PatchTSTEncoder import PatchTSTFeatureExtractor
 from src.models.x_encoder import XEncoder
 from src.clustering.kcenter import generate_pseudo_labels
 from src.losses.center_loss import CenterLoss
+from src.losses.supcon_loss import SupervisedContrastiveLoss
 from src.trainers.metric_trainer import MetricTrainer
 from src.clustering.spectral_selector import SpectralSelector
 
@@ -221,13 +222,20 @@ def run_stage3(all_X, all_Y, pseudo_labels, cfg: PipelineConfig, device: str) ->
     valid_X = all_X[valid_mask]
     valid_labels = pseudo_labels[valid_mask]
 
-    # 构建模型
+    # 构建模型 (PatchTST backbone)
     x_encoder = XEncoder(
         feature_dim=cfg.feature_dim,
         hidden_dim=cfg.x_hidden_dim,
-        lstm_hidden_size=cfg.lstm_hidden_size,
-        lstm_layers=cfg.lstm_layers,
         num_classes=cfg.K,
+        seq_len=cfg.seq_len,
+        patch_len=cfg.x_patch_len,
+        stride=cfg.x_stride,
+        d_model=cfg.x_d_model,
+        n_heads=cfg.x_n_heads,
+        e_layers=cfg.x_e_layers,
+        d_ff=cfg.x_d_ff,
+        aggregation=cfg.x_aggregation,
+        concat_rev_params=cfg.x_concat_rev_params,
     )
 
     center_loss = CenterLoss(
@@ -235,12 +243,18 @@ def run_stage3(all_X, all_Y, pseudo_labels, cfg: PipelineConfig, device: str) ->
         feat_dim=cfg.x_hidden_dim,
     )
 
+    supcon_loss = SupervisedContrastiveLoss(
+        temperature=cfg.supcon_temperature,
+    )
+
     trainer = MetricTrainer(
         encoder=x_encoder,
         center_loss=center_loss,
+        supcon_loss=supcon_loss,
         lr_encoder=cfg.lr_encoder,
         lr_centers=cfg.lr_centers,
         center_loss_weight=cfg.center_loss_weight,
+        supcon_loss_weight=cfg.supcon_loss_weight,
         device=device,
     )
 

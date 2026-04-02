@@ -22,6 +22,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from configs.default import PipelineConfig
 from src.models.x_encoder import XEncoder
 from src.losses.center_loss import CenterLoss
+from src.losses.supcon_loss import SupervisedContrastiveLoss
 from src.trainers.metric_trainer import MetricTrainer
 
 
@@ -33,6 +34,8 @@ def main():
     parser.add_argument('--lr_encoder', type=float, default=None, help='X-Encoder 学习率')
     parser.add_argument('--lr_centers', type=float, default=None, help='Center Loss 学习率')
     parser.add_argument('--center_loss_weight', type=float, default=None, help='Center Loss 权重 λ')
+    parser.add_argument('--supcon_loss_weight', type=float, default=None, help='SupCon Loss 权重')
+    parser.add_argument('--supcon_temperature', type=float, default=None, help='SupCon 温度参数')
     parser.add_argument('--output_dir', type=str, default='outputs/stage3',
                         help='输出目录')
     args = parser.parse_args()
@@ -55,19 +58,30 @@ def main():
         cfg.lr_centers = args.lr_centers
     if args.center_loss_weight is not None:
         cfg.center_loss_weight = args.center_loss_weight
+    if args.supcon_loss_weight is not None:
+        cfg.supcon_loss_weight = args.supcon_loss_weight
+    if args.supcon_temperature is not None:
+        cfg.supcon_temperature = args.supcon_temperature
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"[Stage 3] X-Encoder Metric Learning Training")
     print(f"  epochs={cfg.epochs}, batch_size={cfg.batch_size}, "
           f"lr={cfg.lr_encoder}, lr_centers={cfg.lr_centers}, λ={cfg.center_loss_weight}")
 
-    # 构建 X-Encoder
+    # 构建 X-Encoder (PatchTST backbone)
     x_encoder = XEncoder(
         feature_dim=cfg.feature_dim,
         hidden_dim=cfg.x_hidden_dim,
-        lstm_hidden_size=cfg.lstm_hidden_size,
-        lstm_layers=cfg.lstm_layers,
         num_classes=cfg.K,
+        seq_len=cfg.seq_len,
+        patch_len=cfg.x_patch_len,
+        stride=cfg.x_stride,
+        d_model=cfg.x_d_model,
+        n_heads=cfg.x_n_heads,
+        e_layers=cfg.x_e_layers,
+        d_ff=cfg.x_d_ff,
+        aggregation=cfg.x_aggregation,
+        concat_rev_params=cfg.x_concat_rev_params,
     )
 
     # 构建 Center Loss
@@ -76,13 +90,20 @@ def main():
         feat_dim=cfg.x_hidden_dim,
     )
 
+    # 构建 Supervised Contrastive Loss
+    supcon_loss = SupervisedContrastiveLoss(
+        temperature=cfg.supcon_temperature,
+    )
+
     # 构建训练器
     trainer = MetricTrainer(
         encoder=x_encoder,
         center_loss=center_loss,
+        supcon_loss=supcon_loss,
         lr_encoder=cfg.lr_encoder,
         lr_centers=cfg.lr_centers,
         center_loss_weight=cfg.center_loss_weight,
+        supcon_loss_weight=cfg.supcon_loss_weight,
         device=device,
     )
 

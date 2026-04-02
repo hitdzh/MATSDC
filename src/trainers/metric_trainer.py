@@ -4,9 +4,10 @@
 实现 X-Encoder 的联合训练逻辑:
   - 分类损失 (CrossEntropy): 利用伪标签进行监督训练
   - 度量学习损失 (Center Loss): 缩小同类特征在高维空间的欧氏距离
+  - 监督对比损失 (SupCon Loss): 在余弦空间优化同类相似度
 
 联合 Loss:
-  L_total = L_CE + λ * L_center
+  L_total = L_CE + λ₁ * L_center + λ₂ * L_supcon
 """
 
 import torch
@@ -29,14 +30,18 @@ class MetricTrainer:
         self,
         encoder: nn.Module,
         center_loss: nn.Module,
+        supcon_loss: nn.Module = None,
         lr_encoder: float = 1e-3,
         lr_centers: float = 0.5,
         center_loss_weight: float = 1.0,
+        supcon_loss_weight: float = 0.1,
         device: str = 'cpu',
     ):
         self.encoder = encoder.to(device)
         self.center_loss = center_loss.to(device)
+        self.supcon_loss = supcon_loss.to(device) if supcon_loss else None
         self.center_loss_weight = center_loss_weight
+        self.supcon_loss_weight = supcon_loss_weight
         self.device = device
 
         # 主优化器: Adam 更新编码器所有参数
@@ -93,11 +98,16 @@ class MetricTrainer:
             # 计算分类损失
             loss_ce = self.ce_criterion(logits, labels_valid)
 
-            # 计算度量学习损失（Center Loss）
+            # 计算度量学��损失（Center Loss）
             loss_center = self.center_loss(features, labels_valid)
 
             # 联合损失
             loss_total = loss_ce + self.center_loss_weight * loss_center
+
+            # 监督对比损失（SupCon Loss）
+            if self.supcon_loss is not None:
+                loss_supcon = self.supcon_loss(features, labels_valid)
+                loss_total = loss_total + self.supcon_loss_weight * loss_supcon
 
             # 反向传播
             self.optimizer_encoder.zero_grad()
