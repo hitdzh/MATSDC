@@ -1,4 +1,13 @@
 #!/bin/bash
+
+echo "Available GPUs:"
+nvidia-smi --query-gpu=index,name,memory.free --format=csv,noheader
+echo ""
+read -p "Select GPU index (default 0): " gpu_idx
+gpu_idx=${gpu_idx:-0}
+
+export CUDA_VISIBLE_DEVICES=$gpu_idx
+
 if [ ! -d "./logs" ]; then
     mkdir ./logs
 fi
@@ -13,9 +22,9 @@ feature_dim=21
 K=10
 n_clusters=8
 n_prototypes=8
-epochs=50
+epochs=100
 batch_size=256
-pretrain_epochs=30
+pretrain_epochs=100
 pretrain_lr=0.001
 pretrain_batch_size=256
 

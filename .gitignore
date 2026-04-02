@@ -1,3 +1,6 @@
 
 datasets/*.csv
 outputs/*
+logs/*
+**/__pycache__/
+src/*/__pycache__/
