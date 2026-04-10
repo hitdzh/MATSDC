@@ -54,6 +54,9 @@ class PipelineConfig:
     # ==================== 聚类参数 ====================
     K: int = 5                       # K-Center 聚类数（伪标签类别数）
     kcenter_method: str = 'kcenter'  # K-Center 方法
+    dbscan_eps: float = 0.5          # DBSCAN 邻域半径阈值
+    dbscan_min_samples: int = 5      # DBSCAN core point 的最小邻域样本数
+    dbscan_chunk_size: int = 2048    # DBSCAN GPU 分块距离计算大小
     n_clusters: int = 4              # 谱聚类簇数
     n_prototypes: int = 4            # 最终提取的典型样本数 N
     spectral_sigma: float = 1.0      # 谱聚类 RBF 核带宽参数
