@@ -1,12 +1,12 @@
 """
 谱聚类与样本提取
 
+采用 GPU-only 的 landmark 近似谱聚类：
   1. 特征 L2 归一化
-  2. 计算 RBF 亲和度矩阵
-  3. 计算归一化拉普拉斯矩阵
-  4. 特征分解得到特征向量
-  5. K-Means++ 聚类特征向量
-  6. 从每个簇中选取 prototype 
+  2. 采样 landmark 构造二部图相似度
+  3. 在 landmark 空间求近似谱嵌入
+  4. K-Means++ 聚类嵌入特征
+  5. 从每个簇中选取 prototype
 """
 
 import numpy as np
@@ -15,12 +15,15 @@ import torch
 
 class SpectralSelector:
     """
-    谱聚类 + 样本提取
+    谱聚类 + 样本提取。
 
     Args:
         n_clusters: 谱聚类簇数
         n_prototypes: 最终提取的典型样本数量 N
-        sigma: RBF 核带宽参数(default = 0.5)
+        sigma: RBF 核带宽参数
+        n_landmarks: 近似谱聚类的 landmark 数量
+        chunk_size: 构建二部图亲和度时的分块大小
+        seed: 随机种子
     """
 
     def __init__(
@@ -28,88 +31,141 @@ class SpectralSelector:
         n_clusters: int = 4,
         n_prototypes: int = 4,
         sigma: float | None = None,
+        n_landmarks: int = 1024,
+        chunk_size: int = 4096,
+        seed: int = 42,
     ):
         self.n_clusters = n_clusters
         self.n_prototypes = n_prototypes
         self.sigma = sigma
+        self.n_landmarks = n_landmarks
+        self.chunk_size = chunk_size
+        self.seed = seed
 
+    def _synchronize(self, device: torch.device) -> None:
+        torch.cuda.synchronize(device)
+        torch.cuda.empty_cache()
+
+    def _chunk_slices(self, total: int):
+        for start in range(0, total, self.chunk_size):
+            yield start, min(start + self.chunk_size, total)
 
     def _estimate_sigma(self, features_t: torch.Tensor) -> float:
-        N = features_t.shape[0]
-        dist = torch.cdist(features_t, features_t, p=2)  # (N, N)
-        upper_idx = torch.triu_indices(N, N, offset=1, device=features_t.device)
-        upper = dist[upper_idx[0], upper_idx[1]]  # 1D
-        sigma = torch.median(upper[upper > 0]).item()
-        del dist, upper
+        n_points = features_t.shape[0]
+        if n_points <= 1:
+            return 1.0
+
+        dist = torch.cdist(features_t, features_t, p=2)
+        upper_idx = torch.triu_indices(
+            n_points,
+            n_points,
+            offset=1,
+            device=features_t.device,
+        )
+        upper = dist[upper_idx[0], upper_idx[1]]
+        positive = upper[upper > 0]
+        if positive.numel() == 0:
+            return 1.0
+        sigma = torch.median(positive).item()
         return max(sigma, 1e-5)
-    
-    # 亲和度矩阵计算
-    def _compute_affinity(
+
+    def _compute_cross_affinity(
         self,
-        features_t: torch.Tensor,
+        lhs: torch.Tensor,
+        rhs: torch.Tensor,
         sigma: float,
     ) -> torch.Tensor:
-        # L2距离
-        dist = torch.cdist(features_t, features_t, p=2)  # (N, N)
-
-        dist_sq = dist.pow(2)
-        del dist
-
-        # RBF核: exp(-||x-y||^2 / (2σ²))
+        dist_sq = torch.cdist(lhs, rhs, p=2).pow(2)
         inv_2sigma_sq = -0.5 / (sigma ** 2)
-        affinity = torch.exp(dist_sq * inv_2sigma_sq)
-        del dist_sq
+        return torch.exp(dist_sq * inv_2sigma_sq)
 
-        # RBF核对角线应为1.0
-        affinity.fill_diagonal_(1.0)
-        return affinity
+    def _sample_landmarks(self, features_t: torch.Tensor) -> tuple[torch.Tensor, int]:
+        n_points = features_t.shape[0]
+        n_landmarks = min(n_points, max(self.n_clusters, self.n_landmarks))
 
-    # 归一化拉普拉斯矩阵
-    def _compute_laplacian(self, affinity: torch.Tensor) -> torch.Tensor:
-        """
-        L = I - D^(-1/2) * A * D^(-1/2)
-        """
-        N = affinity.shape[0]
-        d = affinity.sum(dim=1).clamp_(min=1e-10)  # (N,)
-        d_inv_sqrt = d.pow(-0.5)  # (N,)
+        generator = torch.Generator(device='cpu')
+        generator.manual_seed(self.seed)
+        landmark_indices = torch.randperm(n_points, generator=generator)[:n_landmarks]
+        landmark_indices = landmark_indices.to(features_t.device, non_blocking=True)
+        return features_t[landmark_indices], n_landmarks
 
-        # D^(-1/2) * A * D^(-1/2)
-        L = affinity * d_inv_sqrt.unsqueeze(1)
-        L = L * d_inv_sqrt.unsqueeze(0)
-
-        # L_sym = I - (D^(-1/2) * A * D^(-1/2))
-        L.neg_()  # L = -L
-        L.fill_diagonal_(0.0)
-        L += torch.eye(N, device=affinity.device, dtype=affinity.dtype)  # 加单位阵
-
-        return L
-
-    # 特征分解
-    def _eigendecompose_laplacian(
+    def _build_normalized_bipartite_graph(
         self,
-        L: torch.Tensor,
-        k: int,
+        features_t: torch.Tensor,
+        landmarks_t: torch.Tensor,
+        sigma: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        n_points = features_t.shape[0]
+        n_landmarks = landmarks_t.shape[0]
+
+        row_sums = torch.empty(n_points, dtype=features_t.dtype)
+        col_sums = torch.zeros(n_landmarks, device=features_t.device, dtype=features_t.dtype)
+
+        for start, end in self._chunk_slices(n_points):
+            affinity = self._compute_cross_affinity(features_t[start:end], landmarks_t, sigma)
+            row_sums[start:end] = affinity.sum(dim=1).cpu()
+            col_sums += affinity.sum(dim=0)
+            del affinity
+
+        row_sums = row_sums.clamp_min(1e-10)
+        col_sums = col_sums.clamp_min(1e-10)
+        return row_sums, col_sums
+
+    def _approximate_spectral_embedding(
+        self,
+        features_t: torch.Tensor,
+        landmarks_t: torch.Tensor,
+        sigma: float,
     ) -> torch.Tensor:
-        """
-        Returns:
-            (N, k) 行归一化的top-k特征向量
-        """
-        eigenvalues, eigenvectors = torch.linalg.eigh(L)
+        n_points = features_t.shape[0]
+        k = min(self.n_clusters, landmarks_t.shape[0])
 
-        # 取 除特征值0对应特征向量外 最小的k个
-        U = eigenvectors[:, 1:k + 1]  # (N, k)
+        row_sums, col_sums = self._build_normalized_bipartite_graph(
+            features_t,
+            landmarks_t,
+            sigma,
+        )
+        col_scale = torch.sqrt(col_sums).unsqueeze(0)
 
-        # 将绝对值最大的位置置为正
-        max_idx = U.abs().argmax(dim=0)  # (k,)
-        signs = torch.sign(U[max_idx, torch.arange(k, device=U.device)])
-        signs[signs == 0] = 1
-        U = U * signs
+        gram = torch.zeros(
+            (landmarks_t.shape[0], landmarks_t.shape[0]),
+            device=features_t.device,
+            dtype=features_t.dtype,
+        )
+        for start, end in self._chunk_slices(n_points):
+            affinity = self._compute_cross_affinity(features_t[start:end], landmarks_t, sigma)
+            row_scale = torch.sqrt(
+                row_sums[start:end].to(features_t.device, non_blocking=True)
+            ).unsqueeze(1)
+            normalized = affinity / row_scale / col_scale
+            gram += normalized.transpose(0, 1) @ normalized
+            del affinity, row_scale, normalized
 
-        # 归一化
-        row_norms = U.norm(dim=1, keepdim=True).clamp_(min=1e-12)
-        U = U / row_norms
-        return U
-    
+        eigenvalues, eigenvectors = torch.linalg.eigh(gram)
+        eigenvalues = eigenvalues.clamp_min(1e-10)
+        basis = eigenvectors[:, -k:]
+        singular_values = torch.sqrt(eigenvalues[-k:]).unsqueeze(0)
+
+        embeddings = torch.empty(
+            (n_points, k),
+            device=features_t.device,
+            dtype=features_t.dtype,
+        )
+        for start, end in self._chunk_slices(n_points):
+            affinity = self._compute_cross_affinity(features_t[start:end], landmarks_t, sigma)
+            row_scale = torch.sqrt(
+                row_sums[start:end].to(features_t.device, non_blocking=True)
+            ).unsqueeze(1)
+            normalized = affinity / row_scale / col_scale
+            chunk_embedding = (normalized @ basis) / singular_values
+            chunk_embedding = chunk_embedding / chunk_embedding.norm(
+                dim=1,
+                keepdim=True,
+            ).clamp_min(1e-12)
+            embeddings[start:end] = chunk_embedding
+            del affinity, row_scale, normalized, chunk_embedding
+
+        return embeddings
 
     def _kmeans(
         self,
@@ -117,7 +173,6 @@ class SpectralSelector:
         k: int,
         n_iter: int = 50,
         tol: float = 1e-4,
-        seed: int = 42,
     ) -> np.ndarray:
         """
         K-Means++聚类。
@@ -127,106 +182,73 @@ class SpectralSelector:
             k: 簇数
             n_iter: 最大迭代轮数
             tol: 收敛阈值
-            seed: 随机种子
 
         Returns:
             (N,) 簇标签
         """
-        N, D = X.shape
+        n_points, dim = X.shape
         device = X.device
-        k = min(k, N)
+        k = min(k, n_points)
 
-        torch.manual_seed(seed)
+        torch.manual_seed(self.seed)
 
-        # K-Means++ 初始化
-        centroids = torch.empty(k, D, device=device, dtype=X.dtype)
+        centroids = torch.empty(k, dim, device=device, dtype=X.dtype)
+        centroids[0] = X[torch.randperm(n_points, device=device)[0]]
 
-        # 随机选一个点
-        centroids[0] = X[torch.randperm(N, device=device)[0]]
-
-        # 按到最近中心距离的平方比例抽样
         for i in range(1, k):
-            dists = torch.cdist(X, centroids[:i])  # (N, i)
-            min_sq = dists.min(dim=1)[0].pow(2)  # (N,)
+            dists = torch.cdist(X, centroids[:i])
+            min_sq = dists.min(dim=1)[0].pow(2)
+            total_mass = min_sq.sum().item()
+            if total_mass <= 0:
+                centroids[i] = X[torch.randperm(n_points, device=device)[0]]
+                continue
 
-            # 构造累积分布
             cumsum = min_sq.cumsum(dim=0)
             threshold = torch.rand(1, device=device) * cumsum[-1]
             idx = (cumsum > threshold).nonzero(as_tuple=True)[0][0].item()
             centroids[i] = X[idx]
 
-        labels = torch.empty(N, dtype=torch.long, device=device)
-
+        labels = torch.zeros(n_points, dtype=torch.long, device=device)
         for _ in range(n_iter):
-            dists = torch.cdist(X, centroids)  # (N, k)
-            new_labels = dists.argmin(dim=1)  # (N,)
+            dists = torch.cdist(X, centroids)
+            new_labels = dists.argmin(dim=1)
 
-            # 处理空簇: 用randperm选一个随机点填补
             counts = new_labels.bincount(minlength=k)
             empty = (counts == 0).nonzero(as_tuple=True)[0]
             if len(empty) > 0:
-                fill_idx = torch.randperm(N, device=device)[:len(empty)]
-                for c, fi in zip(empty.tolist(), fill_idx.tolist()):
-                    new_labels[fi] = c
+                fill_idx = torch.randperm(n_points, device=device)[:len(empty)]
+                for cluster_id, point_idx in zip(empty.tolist(), fill_idx.tolist()):
+                    new_labels[point_idx] = cluster_id
 
-            # 批量更新centroids
             new_centroids = torch.zeros_like(centroids)
-            for c in range(k):
-                mask = new_labels == c
-                if mask.sum() > 0:
-                    new_centroids[c] = X[mask].mean(dim=0)
+            for cluster_id in range(k):
+                mask = new_labels == cluster_id
+                if mask.any().item():
+                    new_centroids[cluster_id] = X[mask].mean(dim=0)
 
             change = (new_centroids - centroids).norm() / (centroids.norm() + 1e-8)
             centroids = new_centroids
-
-            if change < tol:
-                return new_labels.cpu().numpy()
-
             labels = new_labels
+            if change < tol:
+                break
 
         return labels.cpu().numpy()
 
-
     def _spectral_cluster(
         self,
-        features_normed: np.ndarray,
-        device: torch.device,
-    ) -> np.ndarray:
-        features_t = torch.from_numpy(features_normed).to(
-            device, non_blocking=True
+        features_t: torch.Tensor,
+    ) -> tuple[np.ndarray, float, int]:
+        landmarks_t, n_landmarks = self._sample_landmarks(features_t)
+        sigma = self.sigma if self.sigma is not None else self._estimate_sigma(landmarks_t)
+
+        embeddings = self._approximate_spectral_embedding(
+            features_t,
+            landmarks_t,
+            sigma,
         )
-
-        # 估算sigma
-        if self.sigma is None:
-            sigma = self._estimate_sigma(features_t)
-        else:
-            sigma = self.sigma
-
-        # RBF亲和度矩阵
-        affinity = self._compute_affinity(features_t, sigma)
-        del features_t
-        torch.cuda.synchronize(device)
-        torch.cuda.empty_cache()
-
-        # 归一化拉普拉斯
-        L = self._compute_laplacian(affinity)
-        del affinity
-        torch.cuda.synchronize(device)
-        torch.cuda.empty_cache()
-
-        # 特征分解
-        U = self._eigendecompose_laplacian(L, self.n_clusters)
-        del L
-        torch.cuda.synchronize(device)
-        torch.cuda.empty_cache()
-
-        labels = self._kmeans(U, self.n_clusters, seed=42)
-        del U
-        torch.cuda.synchronize(device)
-        torch.cuda.empty_cache()
-
-        return labels
-
+        labels = self._kmeans(embeddings, self.n_clusters)
+        self._synchronize(features_t.device)
+        return labels, sigma, n_landmarks
 
     def _select_prototypes(
         self,
@@ -242,54 +264,53 @@ class SpectralSelector:
         cluster_prototypes = {}
         cluster_sizes = {}
 
-        for c in unique_labels:
-            mask = labels == c
+        for cluster_id in unique_labels:
+            mask = labels == cluster_id
             cluster_features = features[mask]
             cluster_indices = np.where(mask)[0]
-            cluster_sizes[c] = mask.sum()
+            cluster_sizes[cluster_id] = mask.sum()
 
             centroid = cluster_features.mean(axis=0)
-            dists_to_centroid = np.linalg.norm(
-                cluster_features - centroid, axis=1
-            )
+            dists_to_centroid = np.linalg.norm(cluster_features - centroid, axis=1)
             closest_idx_in_cluster = np.argmin(dists_to_centroid)
-            cluster_prototypes[c] = cluster_indices[closest_idx_in_cluster]
+            cluster_prototypes[cluster_id] = cluster_indices[closest_idx_in_cluster]
 
         if self.n_prototypes >= n_clusters_actual:
-            selected = [cluster_prototypes[c] for c in unique_labels]
-
+            selected = [cluster_prototypes[cluster_id] for cluster_id in unique_labels]
             remaining = self.n_prototypes - n_clusters_actual
             if remaining > 0:
                 total_size = sum(cluster_sizes.values())
                 extra_per_cluster = {}
                 allocated = 0
-                for c in unique_labels:
-                    proportion = cluster_sizes[c] / total_size
+                for cluster_id in unique_labels:
+                    proportion = cluster_sizes[cluster_id] / total_size
                     extra = int(np.floor(proportion * remaining))
-                    extra_per_cluster[c] = extra
+                    extra_per_cluster[cluster_id] = extra
                     allocated += extra
 
-                for c in sorted(
-                    unique_labels, key=lambda x: cluster_sizes[x], reverse=True
+                for cluster_id in sorted(
+                    unique_labels,
+                    key=lambda item: cluster_sizes[item],
+                    reverse=True,
                 ):
                     if allocated >= remaining:
                         break
-                    extra_per_cluster[c] += 1
+                    extra_per_cluster[cluster_id] += 1
                     allocated += 1
 
-                for c in unique_labels:
-                    extra = extra_per_cluster.get(c, 0)
+                for cluster_id in unique_labels:
+                    extra = extra_per_cluster.get(cluster_id, 0)
                     if extra <= 0:
                         continue
-                    mask = labels == c
+
+                    mask = labels == cluster_id
                     cluster_indices = np.where(mask)[0]
                     cluster_features = features[mask]
                     centroid = cluster_features.mean(axis=0)
                     dists = np.linalg.norm(cluster_features - centroid, axis=1)
 
-                    sorted_order = np.argsort(dists)
                     count = 0
-                    for rank in sorted_order:
+                    for rank in np.argsort(dists):
                         candidate = cluster_indices[rank]
                         if candidate not in selected:
                             selected.append(candidate)
@@ -299,7 +320,7 @@ class SpectralSelector:
         else:
             total_size = sum(cluster_sizes.values())
             weights = np.array(
-                [cluster_sizes[c] / total_size for c in unique_labels]
+                [cluster_sizes[cluster_id] / total_size for cluster_id in unique_labels]
             )
             selected_clusters = np.random.choice(
                 unique_labels,
@@ -307,7 +328,7 @@ class SpectralSelector:
                 replace=False,
                 p=weights,
             )
-            selected = [cluster_prototypes[c] for c in selected_clusters]
+            selected = [cluster_prototypes[cluster_id] for cluster_id in selected_clusters]
 
         return selected
 
@@ -318,8 +339,12 @@ class SpectralSelector:
         Y_raw: torch.Tensor | np.ndarray,
     ) -> dict:
         """
-        执行谱聚类 + 样本提取
+        执行谱聚类 + 样本提取。
         """
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "Stage 4 requires CUDA. Please run the pipeline on a GPU-enabled environment."
+            )
 
         if isinstance(features, torch.Tensor):
             features_np = features.detach().cpu().numpy()
@@ -336,24 +361,22 @@ class SpectralSelector:
         else:
             Y_np = np.asarray(Y_raw)
 
-        N = features_np.shape[0]
-
-        # L2归一化
         norms = np.linalg.norm(features_np, axis=1, keepdims=True)
         norms = np.maximum(norms, 1e-8)
         features_normed = features_np / norms
 
-        device = torch.device("cuda")
-        cluster_labels = self._spectral_cluster(features_normed, device)
+        device = torch.device('cuda')
+        features_t = torch.from_numpy(features_normed).to(device, non_blocking=True)
+        cluster_labels, sigma, n_landmarks = self._spectral_cluster(features_t)
 
         print(
-            f"  谱聚类完成 [GPU]: {self.n_clusters} 簇, "
+            "  谱聚类完成 [GPU-only approx]: "
+            f"{self.n_clusters} 簇, landmarks={n_landmarks}, sigma={sigma:.6f}, "
+            f"chunk_size={self.chunk_size}, "
             f"大小分布: {[int((cluster_labels == i).sum()) for i in range(self.n_clusters)]}"
         )
 
-        # Prototype选取
         prototype_indices = self._select_prototypes(features_normed, cluster_labels)
-
         result = {
             "X": X_np[prototype_indices],
             "Y": Y_np[prototype_indices],
@@ -361,5 +384,4 @@ class SpectralSelector:
             "cluster_ids": cluster_labels[prototype_indices],
             "indices": np.array(prototype_indices),
         }
-
         return result

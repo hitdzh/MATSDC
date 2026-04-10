@@ -2,7 +2,7 @@
 全局超参数配置模块
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass
@@ -30,7 +30,7 @@ class PipelineConfig:
     x_concat_rev_params: bool = True # 是否拼接 RevIN 统计参数
     
     # 以下为 Autoformer/Informer/Transformer 模型参数
-    label_len: int = 336              # 解码器起始长度（通常等于 seq_len）
+    label_len: int | None = None      # 解码器起始长度；None 时自动取 seq_len // 2
     enc_in: int = 21                 # 编码器输入维度（特征数）
     dec_in: int = 21                 # 解码器输入维度
     c_out: int = 128                  # 输出维度
@@ -53,11 +53,13 @@ class PipelineConfig:
 
     # ==================== 聚类参数 ====================
     K: int = 5                       # K-Center 聚类数（伪标签类别数）
-    kcenter_method: str = 'greedy'   # K-Center 方法: 'greedy' 或 'robust'
-    outliers_fraction: float = 0.05  # Robust K-Center 异常值比例
+    kcenter_method: str = 'kcenter'  # K-Center 方法
     n_clusters: int = 4              # 谱聚类簇数
     n_prototypes: int = 4            # 最终提取的典型样本数 N
     spectral_sigma: float = 1.0      # 谱聚类 RBF 核带宽参数
+    spectral_landmarks: int = 1024   # 近似谱聚类 landmark 数量
+    spectral_chunk_size: int = 4096  # 近似谱聚类分块大小
+    spectral_seed: int = 42          # 近似谱聚类随机种子
 
     # ==================== 训练参数 ====================
     epochs: int = 2                  # 阶段3 训练轮数

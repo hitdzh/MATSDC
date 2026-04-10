@@ -139,9 +139,8 @@ def _extract_patchtst_encoder_config(encoder: PatchTSTFeatureExtractor, seq_len:
     }
 
 
-def _save_y_encoder(encoder: PatchTSTFeatureExtractor, cfg: PipelineConfig, save_dir: str) -> str:
-    os.makedirs(save_dir, exist_ok=True)
-    save_path = os.path.join(save_dir, f'{cfg.dataset}_y_encoder.pt')
+def _save_y_encoder(encoder: PatchTSTFeatureExtractor, cfg: PipelineConfig, save_path: str) -> str:
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
     torch.save({
         'encoder_state_dict': encoder.state_dict(),
         'encoder_config': _extract_patchtst_encoder_config(encoder, cfg.pre_len),
@@ -160,12 +159,11 @@ def _save_y_encoder(encoder: PatchTSTFeatureExtractor, cfg: PipelineConfig, save
 def _save_x_encoder(
     encoder: XEncoder,
     cfg: PipelineConfig,
-    save_dir: str,
+    save_path: str,
     center_loss: nn.Module | None = None,
     loss_history=None,
 ) -> str:
-    os.makedirs(save_dir, exist_ok=True)
-    save_path = os.path.join(save_dir, f'{cfg.dataset}_x_encoder.pt')
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
     torch.save({
         'encoder_state_dict': encoder.state_dict(),
         'encoder_config': {
@@ -229,6 +227,126 @@ def _ensure_cfg_defaults(cfg: PipelineConfig) -> PipelineConfig:
     return cfg
 
 
+def _normalize_kcenter_method(method: str | None, allow_removed: bool = False) -> str:
+    if method in (None, 'greedy'):
+        return 'kcenter'
+    if method == 'robust':
+        if allow_removed:
+            return 'robust'
+        raise ValueError("robust k-center has been removed; please use 'kcenter'.")
+    if method != 'kcenter':
+        raise ValueError(f"Unknown k-center method: {method}")
+    return method
+
+
+def _resolve_label_len(label_len: int | None, seq_len: int) -> int:
+    resolved = seq_len // 2 if label_len is None else label_len
+    if resolved <= 0 or resolved > seq_len:
+        raise ValueError(
+            f"label_len must be in [1, seq_len], got label_len={resolved}, seq_len={seq_len}."
+        )
+    return resolved
+
+
+def _normalize_cfg(
+    cfg: PipelineConfig,
+    allow_removed_kcenter: bool = False,
+) -> PipelineConfig:
+    cfg = _ensure_cfg_defaults(cfg)
+    cfg.kcenter_method = _normalize_kcenter_method(
+        getattr(cfg, 'kcenter_method', None),
+        allow_removed=allow_removed_kcenter,
+    )
+    cfg.label_len = _resolve_label_len(getattr(cfg, 'label_len', None), cfg.seq_len)
+    return cfg
+
+
+def _format_float_for_path(value: float | None) -> str:
+    if value is None:
+        return 'auto'
+    return f"{value:g}".replace('-', 'm').replace('.', 'p')
+
+
+def _stage1_artifact_id(cfg: PipelineConfig) -> str:
+    return f"{cfg.dataset}_{cfg.seq_len}_{cfg.pre_len}"
+
+
+def _stage2_artifact_id(cfg: PipelineConfig) -> str:
+    return f"{_stage1_artifact_id(cfg)}_K{cfg.K}_{cfg.kcenter_method}"
+
+
+def _stage3_artifact_id(cfg: PipelineConfig) -> str:
+    return _stage2_artifact_id(cfg)
+
+
+def _stage4_artifact_id(cfg: PipelineConfig) -> str:
+    sigma_tag = _format_float_for_path(cfg.spectral_sigma)
+    return (
+        f"{_stage3_artifact_id(cfg)}_NC{cfg.n_clusters}_NP{cfg.n_prototypes}"
+        f"_SG{sigma_tag}_LL{cfg.label_len}"
+    )
+
+
+def _stage1_output_path(cfg: PipelineConfig) -> str:
+    return os.path.join('outputs', 'stage1', f'{_stage1_artifact_id(cfg)}_data.pt')
+
+
+def _stage2_output_path(cfg: PipelineConfig) -> str:
+    return os.path.join('outputs', 'stage2', f'{_stage2_artifact_id(cfg)}_pseudo_labels.pt')
+
+
+def _stage3_output_path(cfg: PipelineConfig) -> str:
+    return os.path.join('outputs', 'stage3', f'{_stage3_artifact_id(cfg)}_trained_encoder.pt')
+
+
+def _stage4_output_path(cfg: PipelineConfig) -> str:
+    return os.path.join('outputs', 'stage4', f'{_stage4_artifact_id(cfg)}_prototypes.pt')
+
+
+def _condensed_output_path(cfg: PipelineConfig) -> str:
+    return os.path.join(
+        'outputs',
+        'CondensedDatasets',
+        f'Condensed_{_stage4_artifact_id(cfg)}.pt',
+    )
+
+
+def _y_encoder_output_path(cfg: PipelineConfig) -> str:
+    return os.path.join('outputs', 'Y_Encoder', f'{_stage2_artifact_id(cfg)}_y_encoder.pt')
+
+
+def _x_encoder_output_path(cfg: PipelineConfig) -> str:
+    return os.path.join('outputs', 'X_Encoder', f'{_stage3_artifact_id(cfg)}_x_encoder.pt')
+
+
+def _load_artifact(primary_path: str, legacy_paths: list[str] | None = None) -> tuple[dict, str]:
+    for path in [primary_path, *(legacy_paths or [])]:
+        if os.path.exists(path):
+            return torch.load(path, weights_only=False), path
+    searched = [primary_path, *(legacy_paths or [])]
+    raise FileNotFoundError(f"Artifact not found. Tried: {searched}")
+
+
+def _assert_cfg_matches(
+    current_cfg: PipelineConfig,
+    saved_cfg: PipelineConfig,
+    keys: list[str],
+    artifact_path: str,
+) -> None:
+    mismatches = []
+    for key in keys:
+        current_value = getattr(current_cfg, key)
+        saved_value = getattr(saved_cfg, key)
+        if current_value != saved_value:
+            mismatches.append(f"{key}: current={current_value}, saved={saved_value}")
+
+    if mismatches:
+        mismatch_text = '\n'.join(f'  - {item}' for item in mismatches)
+        raise ValueError(
+            f"Resume config mismatch for {artifact_path}:\n{mismatch_text}"
+        )
+
+
 def run_stage1(cfg: PipelineConfig, args) -> tuple[torch.Tensor, torch.Tensor]:
     """阶段 1"""
     print(f"[Stage 1] Data Preparation — dataset={cfg.dataset}")
@@ -267,10 +385,10 @@ def run_stage1(cfg: PipelineConfig, args) -> tuple[torch.Tensor, torch.Tensor]:
     print(f"  Y shape: {all_Y.shape}")
     print(f"  Total samples: {all_X.shape[0]}")
 
-    # 保存中间结果
-    os.makedirs('outputs/stage1', exist_ok=True)
-    torch.save({'X': all_X, 'Y': all_Y, 'config': cfg},
-               f'outputs/stage1/{cfg.dataset}_data.pt')
+    save_path = _stage1_output_path(cfg)
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    torch.save({'X': all_X, 'Y': all_Y, 'config': cfg}, save_path)
+    print(f"  Saved Stage 1 artifact to {save_path}")
 
     return all_X, all_Y
 
@@ -449,17 +567,16 @@ def run_stage2(all_X, all_Y, cfg, device, pretrained_encoder=None) -> np.ndarray
     )
 
     label_dist = [int((pseudo_labels == k).sum()) for k in range(cfg.K)]
-    n_outliers = int((pseudo_labels == -1).sum())
-    # 后续用于加权参考
     print(f"  Label distribution: {label_dist}")
-    if n_outliers > 0:
-        print(f"  Outliers: {n_outliers}")
 
-    # 保存
-    os.makedirs('outputs/stage2', exist_ok=True)
-    torch.save({'pseudo_labels': pseudo_labels, 'centers_idx': centers_idx, 'config': cfg},
-               'outputs/stage2/pseudo_labels.pt')
-    y_encoder_path = _save_y_encoder(y_encoder, cfg, 'outputs/Y_Encoder')
+    save_path = _stage2_output_path(cfg)
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    torch.save(
+        {'pseudo_labels': pseudo_labels, 'centers_idx': centers_idx, 'config': cfg},
+        save_path,
+    )
+    print(f"  Saved Stage 2 artifact to {save_path}")
+    y_encoder_path = _save_y_encoder(y_encoder, cfg, _y_encoder_output_path(cfg))
     print(f"  Saved Y-Encoder to {y_encoder_path}")
 
     return pseudo_labels
@@ -469,7 +586,7 @@ def run_stage3(all_X, all_Y, pseudo_labels, cfg: PipelineConfig, device: str) ->
     """阶段 3"""
     print(f"\n[Stage 3] X-Encoder Metric Learning Training")
 
-    # 过滤异常值，仅保留有效伪标签样本参与 Stage 3 训练
+    # 兼容旧产物中可能存在的 -1 标签，新路径下 kcenter 仅产生非负类别
     valid_mask = pseudo_labels >= 0
     valid_X = all_X[valid_mask]
     valid_labels = pseudo_labels[valid_mask]
@@ -545,8 +662,8 @@ def run_stage3(all_X, all_Y, pseudo_labels, cfg: PipelineConfig, device: str) ->
         num_workers=cfg.num_workers,
     )
 
-    # 保存
-    os.makedirs('outputs/stage3', exist_ok=True)
+    save_path = _stage3_output_path(cfg)
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
     torch.save({
         'encoder_state_dict': x_encoder.state_dict(),
         'center_loss_state_dict': center_loss.state_dict(),
@@ -555,11 +672,12 @@ def run_stage3(all_X, all_Y, pseudo_labels, cfg: PipelineConfig, device: str) ->
         'config': cfg,
         'X': all_X,
         'Y': all_Y,
-    }, 'outputs/stage3/trained_encoder.pt')
+    }, save_path)
+    print(f"  Saved Stage 3 artifact to {save_path}")
     x_encoder_path = _save_x_encoder(
         x_encoder,
         cfg,
-        'outputs/X_Encoder',
+        _x_encoder_output_path(cfg),
         center_loss=center_loss,
         loss_history=loss_history,
     )
@@ -576,6 +694,9 @@ def run_stage4(all_X, all_Y, all_features, cfg: PipelineConfig) -> dict:
         n_clusters=cfg.n_clusters,
         n_prototypes=cfg.n_prototypes,
         sigma=cfg.spectral_sigma,
+        n_landmarks=cfg.spectral_landmarks,
+        chunk_size=cfg.spectral_chunk_size,
+        seed=cfg.spectral_seed,
     )
 
     prototypes = selector.cluster_and_select(
@@ -584,61 +705,78 @@ def run_stage4(all_X, all_Y, all_features, cfg: PipelineConfig) -> dict:
         Y_raw=all_Y,
     )
 
-    # 保存
-    os.makedirs('outputs/stage4', exist_ok=True)
-    torch.save({'prototypes': prototypes, 'config': cfg},
-               'outputs/stage4/prototypes.pt')
+    save_path = _stage4_output_path(cfg)
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    torch.save({'prototypes': prototypes, 'config': cfg}, save_path)
+    print(f"  Saved Stage 4 artifact to {save_path}")
 
-    # 保存数据
-    label_len = cfg.seq_len // 2
-
-    x_enc = torch.from_numpy(prototypes['X'])                  # (N, seq_len, feature_dim)
-    x_dec = torch.cat([x_enc[:, -label_len:, :],
-                       torch.from_numpy(prototypes['Y'])], dim=1)  # (N, label_len+pred_len, feature_dim)
+    x_enc = torch.from_numpy(prototypes['X'])
+    y_enc = torch.from_numpy(prototypes['Y'])
+    x_dec = torch.cat([x_enc[:, -cfg.label_len:, :], y_enc], dim=1)
 
     train_data = {
-        'x_enc': x_enc,         # encoder 输入: (N, seq_len, feature_dim)
-        'x_dec': x_dec,         # decoder 输入: (N, label_len+pred_len, feature_dim)
-        'y_enc': prototypes['Y'],  # encoder 对应的目标: (N, pred_len, feature_dim)
-        'features': prototypes['features'],
-        'cluster_ids': prototypes['cluster_ids'],
-        'indices': prototypes['indices'],
+        'x_enc': x_enc,
+        'x_dec': x_dec,
+        'y_enc': y_enc,
+        'features': torch.from_numpy(prototypes['features']),
+        'cluster_ids': torch.from_numpy(prototypes['cluster_ids']).long(),
+        'indices': torch.from_numpy(prototypes['indices']).long(),
+        'label_len': cfg.label_len,
         'config': cfg,
     }
 
-    os.makedirs('outputs/CondensedDatasets', exist_ok=True)
-    torch.save(train_data, f'outputs/CondensedDatasets/Condensed_{cfg.dataset}.pt')
-    print(f"\n  Saved Condensed_{cfg.dataset}.pt — x_enc: {x_enc.shape}, x_dec: {x_dec.shape}")
+    condensed_path = _condensed_output_path(cfg)
+    os.makedirs(os.path.dirname(condensed_path), exist_ok=True)
+    torch.save(train_data, condensed_path)
+    print(
+        f"\n  Saved condensed dataset to {condensed_path} "
+        f"— x_enc: {x_enc.shape}, x_dec: {x_dec.shape}"
+    )
 
     return prototypes
 
 
 def main():
+    defaults = PipelineConfig()
     parser = argparse.ArgumentParser(description='Full Pipeline: Time Series Prototype Mining')
-    parser.add_argument('--dataset', type=str, default='dummy',
+    parser.add_argument('--dataset', type=str, default=defaults.dataset,
                         choices=['dummy', 'ETTh1', 'ETTh2', 'ETTm1', 'ETTm2',
                                  'electricity', 'traffic', 'weather'])
-    parser.add_argument('--seq_len', type=int, default=336)
-    parser.add_argument('--pre_len', type=int, default=96)
+    parser.add_argument('--seq_len', type=int, default=defaults.seq_len)
+    parser.add_argument('--pre_len', type=int, default=defaults.pre_len)
+    parser.add_argument('--label_len', type=int, default=None,
+                        help='decoder 输入长度；不指定时自动使用 seq_len // 2')
     parser.add_argument('--feature_dim', type=int, default=3, help='仅 dummy')
     parser.add_argument('--T', type=int, default=1000, help='仅 dummy')
-    parser.add_argument('--K', type=int, default=5, help='K-Center 聚类数')
-    parser.add_argument('--n_clusters', type=int, default=4, help='谱聚类簇数')
-    parser.add_argument('--n_prototypes', type=int, default=4, help='提取典型样本数')
-    parser.add_argument('--epochs', type=int, default=2, help='训练轮数')
-    parser.add_argument('--batch_size', type=int, default=32)
+    parser.add_argument('--K', type=int, default=defaults.K, help='K-Center 聚类数')
+    parser.add_argument('--kcenter_method', type=str, default=defaults.kcenter_method,
+                        choices=['kcenter'], help='伪标签聚类算法')
+    parser.add_argument('--n_clusters', type=int, default=defaults.n_clusters, help='谱聚类簇数')
+    parser.add_argument('--n_prototypes', type=int, default=defaults.n_prototypes, help='提取典型样本数')
+    parser.add_argument('--spectral_sigma', type=float, default=defaults.spectral_sigma,
+                        help='谱聚类 RBF 核带宽参数')
+    parser.add_argument('--spectral_landmarks', type=int, default=defaults.spectral_landmarks,
+                        help='近似谱聚类 landmark 数量')
+    parser.add_argument('--spectral_chunk_size', type=int, default=defaults.spectral_chunk_size,
+                        help='近似谱聚类分块大小')
+    parser.add_argument('--spectral_seed', type=int, default=defaults.spectral_seed,
+                        help='近似谱聚类随机种子')
+    parser.add_argument('--epochs', type=int, default=defaults.epochs, help='训练轮数')
+    parser.add_argument('--batch_size', type=int, default=defaults.batch_size)
     parser.add_argument('--num_workers', type=int, default=None,
                         help='DataLoader 工作进程数；不指定则自动推断')
-    parser.add_argument('--pretrain_epochs', type=int, default=5, help='Y-Encoder 预训练轮数')
-    parser.add_argument('--pretrain_lr', type=float, default=1e-3, help='Y-Encoder 预训练学习率')
-    parser.add_argument('--pretrain_batch_size', type=int, default=64, help='Y-Encoder 预训练批大小')
+    parser.add_argument('--pretrain_epochs', type=int, default=defaults.pretrain_epochs, help='Y-Encoder 预训练轮数')
+    parser.add_argument('--pretrain_lr', type=float, default=defaults.pretrain_lr, help='Y-Encoder 预训练学习率')
+    parser.add_argument('--pretrain_batch_size', type=int, default=defaults.pretrain_batch_size, help='Y-Encoder 预训练批大小')
     parser.add_argument('--resume_from', type=int, default=1, choices=[1, 2, 3, 4],
                         help='从指定阶段开始（需有前序输出）')
     parser.add_argument('--pretrained_encoder', type=str, default=None,
                         help='预训练 Y-Encoder 路径 (pretrain_y_encoder.py 输出) ')
     args = parser.parse_args()
 
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    if not torch.cuda.is_available():
+        raise RuntimeError('scripts/run_full_pipeline.py requires CUDA. CPU execution is not supported.')
+    device = 'cuda'
     print(f"Device: {device}")
 
     # 构建配置
@@ -646,10 +784,16 @@ def main():
         dataset=args.dataset,
         seq_len=args.seq_len,
         pre_len=args.pre_len,
+        label_len=args.label_len,
         feature_dim=args.feature_dim,
         K=args.K,
+        kcenter_method=args.kcenter_method,
         n_clusters=args.n_clusters,
         n_prototypes=args.n_prototypes,
+        spectral_sigma=args.spectral_sigma,
+        spectral_landmarks=args.spectral_landmarks,
+        spectral_chunk_size=args.spectral_chunk_size,
+        spectral_seed=args.spectral_seed,
         epochs=args.epochs,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
@@ -657,16 +801,22 @@ def main():
         pretrain_lr=args.pretrain_lr,
         pretrain_batch_size=args.pretrain_batch_size,
     )
-    cfg = _ensure_cfg_defaults(cfg)
+    cfg = _normalize_cfg(cfg)
 
     # ===== 阶段 1 =====
     if args.resume_from <= 1:
         all_X, all_Y = run_stage1(cfg, args)
     else:
         print(f"\n[Stage 1] Skipped (resume_from={args.resume_from})")
-        data = torch.load(f'outputs/stage1/{cfg.dataset}_data.pt', weights_only=False)
+        data, loaded_path = _load_artifact(
+            _stage1_output_path(cfg),
+            legacy_paths=[f'outputs/stage1/{cfg.dataset}_data.pt'],
+        )
         all_X, all_Y = data['X'], data['Y']
-        cfg = _ensure_cfg_defaults(data['config'])
+        saved_cfg = _normalize_cfg(data['config'], allow_removed_kcenter=True)
+        _assert_cfg_matches(cfg, saved_cfg, ['dataset', 'seq_len', 'pre_len'], loaded_path)
+        cfg.feature_dim = all_X.shape[-1]
+        print(f"  Loaded Stage 1 artifact from {loaded_path}")
 
     # ===== 阶段 2 =====
     if args.resume_from <= 2:
@@ -674,19 +824,40 @@ def main():
                                    pretrained_encoder=args.pretrained_encoder)
     else:
         print(f"\n[Stage 2] Skipped (resume_from={args.resume_from})")
-        data = torch.load('outputs/stage2/pseudo_labels.pt', weights_only=False)
+        data, loaded_path = _load_artifact(
+            _stage2_output_path(cfg),
+            legacy_paths=['outputs/stage2/pseudo_labels.pt'],
+        )
         pseudo_labels = data['pseudo_labels']
-        cfg = _ensure_cfg_defaults(data['config'])
+        saved_cfg = _normalize_cfg(data['config'], allow_removed_kcenter=True)
+        _assert_cfg_matches(
+            cfg,
+            saved_cfg,
+            ['dataset', 'seq_len', 'pre_len', 'K', 'kcenter_method'],
+            loaded_path,
+        )
+        print(f"  Loaded Stage 2 artifact from {loaded_path}")
 
     # ===== 阶段 3 =====
     if args.resume_from <= 3:
         all_features = run_stage3(all_X, all_Y, pseudo_labels, cfg, device)
     else:
         print(f"\n[Stage 3] Skipped (resume_from={args.resume_from})")
-        data = torch.load('outputs/stage3/trained_encoder.pt', weights_only=False)
+        data, loaded_path = _load_artifact(
+            _stage3_output_path(cfg),
+            legacy_paths=['outputs/stage3/trained_encoder.pt'],
+        )
         all_features = data['features']
         all_X, all_Y = data['X'], data['Y']
-        cfg = _ensure_cfg_defaults(data['config'])
+        saved_cfg = _normalize_cfg(data['config'], allow_removed_kcenter=True)
+        _assert_cfg_matches(
+            cfg,
+            saved_cfg,
+            ['dataset', 'seq_len', 'pre_len', 'K', 'kcenter_method'],
+            loaded_path,
+        )
+        cfg.feature_dim = all_X.shape[-1]
+        print(f"  Loaded Stage 3 artifact from {loaded_path}")
 
     # ===== 阶段 4 =====
     prototypes = run_stage4(all_X, all_Y, all_features, cfg)
