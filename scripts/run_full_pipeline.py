@@ -31,7 +31,8 @@ from src.data.sliding_window import SlidingWindowDataset
 from src.data.dataset_factory import TimeSeriesForecastDataset
 from src.layers.PatchTSTEncoder import PatchTSTFeatureExtractor
 from src.models.x_encoder import XEncoder
-from src.clustering.kcenter import generate_pseudo_labels
+from src.clustering.kcenter import generate_pseudo_labels as generate_kcenter_pseudo_labels
+from src.clustering.dbscan import generate_pseudo_labels as generate_dbscan_pseudo_labels
 from src.losses.center_loss import CenterLoss
 from src.losses.supcon_loss import SupervisedContrastiveLoss
 from src.trainers.metric_trainer import MetricTrainer
@@ -160,6 +161,7 @@ def _save_x_encoder(
     encoder: XEncoder,
     cfg: PipelineConfig,
     save_path: str,
+    num_classes: int,
     center_loss: nn.Module | None = None,
     loss_history=None,
 ) -> str:
@@ -169,7 +171,7 @@ def _save_x_encoder(
         'encoder_config': {
             'feature_dim': cfg.feature_dim,
             'hidden_dim': cfg.x_hidden_dim,
-            'num_classes': cfg.K,
+            'num_classes': num_classes,
             'seq_len': cfg.seq_len,
             'patch_len': cfg.x_patch_len,
             'stride': cfg.x_stride,
@@ -220,22 +222,29 @@ def _build_stage3_sampling(valid_labels: np.ndarray, num_classes: int, device: s
 
 
 def _ensure_cfg_defaults(cfg: PipelineConfig) -> PipelineConfig:
+    legacy_method = getattr(cfg, 'kcenter_method', None)
+    if legacy_method is not None and not hasattr(cfg, 'pseudo_label_method'):
+        setattr(cfg, 'pseudo_label_method', legacy_method)
+
     defaults = PipelineConfig()
     for key, value in defaults.__dict__.items():
         if not hasattr(cfg, key):
             setattr(cfg, key, value)
+
+    # Backward compatibility for older code/artifacts that still reference kcenter_method.
+    setattr(cfg, 'kcenter_method', getattr(cfg, 'pseudo_label_method'))
     return cfg
 
 
-def _normalize_kcenter_method(method: str | None, allow_removed: bool = False) -> str:
+def _normalize_pseudo_label_method(method: str | None, allow_removed: bool = False) -> str:
     if method in (None, 'greedy'):
         return 'kcenter'
     if method == 'robust':
         if allow_removed:
             return 'robust'
         raise ValueError("robust k-center has been removed; please use 'kcenter'.")
-    if method != 'kcenter':
-        raise ValueError(f"Unknown k-center method: {method}")
+    if method not in ('kcenter', 'dbscan'):
+        raise ValueError(f"Unknown pseudo label method: {method}")
     return method
 
 
@@ -253,11 +262,26 @@ def _normalize_cfg(
     allow_removed_kcenter: bool = False,
 ) -> PipelineConfig:
     cfg = _ensure_cfg_defaults(cfg)
-    cfg.kcenter_method = _normalize_kcenter_method(
-        getattr(cfg, 'kcenter_method', None),
+    cfg.pseudo_label_method = _normalize_pseudo_label_method(
+        getattr(cfg, 'pseudo_label_method', None),
         allow_removed=allow_removed_kcenter,
     )
+    cfg.kcenter_method = cfg.pseudo_label_method
     cfg.label_len = _resolve_label_len(getattr(cfg, 'label_len', None), cfg.seq_len)
+    if cfg.pseudo_label_method == 'kcenter':
+        if cfg.K <= 0:
+            raise ValueError(f"K must be > 0 for kcenter, got {cfg.K}.")
+    if cfg.pseudo_label_method == 'dbscan':
+        if cfg.dbscan_eps <= 0:
+            raise ValueError(f"dbscan_eps must be > 0, got {cfg.dbscan_eps}.")
+        if cfg.dbscan_min_samples <= 0:
+            raise ValueError(
+                f"dbscan_min_samples must be > 0, got {cfg.dbscan_min_samples}."
+            )
+        if cfg.dbscan_chunk_size <= 0:
+            raise ValueError(
+                f"dbscan_chunk_size must be > 0, got {cfg.dbscan_chunk_size}."
+            )
     return cfg
 
 
@@ -271,8 +295,17 @@ def _stage1_artifact_id(cfg: PipelineConfig) -> str:
     return f"{cfg.dataset}_{cfg.seq_len}_{cfg.pre_len}"
 
 
+def _pseudo_label_artifact_tag(cfg: PipelineConfig) -> str:
+    if cfg.pseudo_label_method == 'kcenter':
+        return f'K{cfg.K}_kcenter'
+    if cfg.pseudo_label_method == 'dbscan':
+        eps_tag = _format_float_for_path(cfg.dbscan_eps)
+        return f'dbscan_E{eps_tag}_MS{cfg.dbscan_min_samples}'
+    raise ValueError(f"Unsupported pseudo label method: {cfg.pseudo_label_method}")
+
+
 def _stage2_artifact_id(cfg: PipelineConfig) -> str:
-    return f"{_stage1_artifact_id(cfg)}_K{cfg.K}_{cfg.kcenter_method}"
+    return f"{_stage1_artifact_id(cfg)}_{_pseudo_label_artifact_tag(cfg)}"
 
 
 def _stage3_artifact_id(cfg: PipelineConfig) -> str:
@@ -345,6 +378,31 @@ def _assert_cfg_matches(
         raise ValueError(
             f"Resume config mismatch for {artifact_path}:\n{mismatch_text}"
         )
+
+
+def _stage2_resume_keys(cfg: PipelineConfig) -> list[str]:
+    keys = ['dataset', 'seq_len', 'pre_len', 'pseudo_label_method']
+    if cfg.pseudo_label_method == 'kcenter':
+        keys.append('K')
+    elif cfg.pseudo_label_method == 'dbscan':
+        keys.extend(['dbscan_eps', 'dbscan_min_samples'])
+    return keys
+
+
+def _infer_num_classes_from_labels(pseudo_labels: np.ndarray) -> int:
+    unique_valid_labels = np.unique(pseudo_labels[pseudo_labels >= 0])
+    if unique_valid_labels.size == 0:
+        raise ValueError("Pseudo labels contain no valid non-noise classes.")
+    return int(unique_valid_labels.size)
+
+
+def _remap_pseudo_labels(pseudo_labels: np.ndarray) -> np.ndarray:
+    pseudo_labels = np.asarray(pseudo_labels, dtype=np.int64)
+    remapped = np.full_like(pseudo_labels, -1)
+    unique_valid_labels = np.unique(pseudo_labels[pseudo_labels >= 0])
+    for new_label, old_label in enumerate(unique_valid_labels.tolist()):
+        remapped[pseudo_labels == old_label] = new_label
+    return remapped
 
 
 def run_stage1(cfg: PipelineConfig, args) -> tuple[torch.Tensor, torch.Tensor]:
@@ -553,26 +611,61 @@ def _build_y_encoder(cfg, device, pretrained_path=None, Y_data=None):
 
 def run_stage2(all_X, all_Y, cfg, device, pretrained_encoder=None) -> np.ndarray:
     """阶段 2"""
-    print(f"\n[Stage 2] Pseudo Labeling")
+    print(f"\n[Stage 2] Pseudo Labeling ({cfg.pseudo_label_method})")
 
     y_encoder = _build_y_encoder(cfg, device, pretrained_encoder, Y_data=all_Y)
 
-    pseudo_labels, centers_idx = generate_pseudo_labels(
-        Y_data=all_Y,
-        encoder=y_encoder,
-        K=cfg.K,
-        method=cfg.kcenter_method,
-        batch_size=cfg.pretrain_batch_size,
-        num_workers=cfg.num_workers or 0,
-    )
+    if cfg.pseudo_label_method == 'kcenter':
+        pseudo_labels, representative_indices = generate_kcenter_pseudo_labels(
+            Y_data=all_Y,
+            encoder=y_encoder,
+            K=cfg.K,
+            method=cfg.pseudo_label_method,
+            batch_size=cfg.pretrain_batch_size,
+            num_workers=cfg.num_workers or 0,
+        )
+    elif cfg.pseudo_label_method == 'dbscan':
+        pseudo_labels, representative_indices = generate_dbscan_pseudo_labels(
+            Y_data=all_Y,
+            encoder=y_encoder,
+            eps=cfg.dbscan_eps,
+            min_samples=cfg.dbscan_min_samples,
+            batch_size=cfg.pretrain_batch_size,
+            num_workers=cfg.num_workers or 0,
+            chunk_size=cfg.dbscan_chunk_size,
+        )
+    else:
+        raise ValueError(f"Unsupported pseudo label method: {cfg.pseudo_label_method}")
 
-    label_dist = [int((pseudo_labels == k).sum()) for k in range(cfg.K)]
+    pseudo_labels = _remap_pseudo_labels(pseudo_labels)
+    num_classes = _infer_num_classes_from_labels(pseudo_labels)
+    label_dist = [int((pseudo_labels == k).sum()) for k in range(num_classes)]
+    noise_count = int((pseudo_labels == -1).sum())
+    total_samples = int(pseudo_labels.shape[0])
+    print(f"  Effective classes: {num_classes}")
     print(f"  Label distribution: {label_dist}")
+    print("  Label ratios:")
+    for class_id, class_count in enumerate(label_dist):
+        print(
+            f"    Class {class_id}: count={class_count}, "
+            f"ratio={class_count / total_samples:.2%}"
+        )
+    if noise_count > 0:
+        print(
+            f"  Noise samples: {noise_count}, "
+            f"ratio={noise_count / total_samples:.2%}"
+        )
 
     save_path = _stage2_output_path(cfg)
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     torch.save(
-        {'pseudo_labels': pseudo_labels, 'centers_idx': centers_idx, 'config': cfg},
+        {
+            'pseudo_labels': pseudo_labels,
+            'representative_indices': representative_indices,
+            'centers_idx': representative_indices,
+            'num_classes': num_classes,
+            'config': cfg,
+        },
         save_path,
     )
     print(f"  Saved Stage 2 artifact to {save_path}")
@@ -592,15 +685,17 @@ def run_stage3(all_X, all_Y, pseudo_labels, cfg: PipelineConfig, device: str) ->
     valid_labels = pseudo_labels[valid_mask]
     if valid_labels.size == 0:
         raise ValueError("Stage 3 received no valid pseudo labels; all labels are -1.")
-    sampler, class_weights, class_counts = _build_stage3_sampling(valid_labels, cfg.K, device)
+    num_classes = _infer_num_classes_from_labels(pseudo_labels)
+    sampler, class_weights, class_counts = _build_stage3_sampling(valid_labels, num_classes, device)
     print(f"  Valid samples: {valid_X.shape[0]} / {all_X.shape[0]}")
+    print(f"  Effective classes: {num_classes}")
     print(f"  Class counts: {class_counts.tolist()}")
 
     # 构建模型 (PatchTST backbone)
     x_encoder = XEncoder(
         feature_dim=cfg.feature_dim,
         hidden_dim=cfg.x_hidden_dim,
-        num_classes=cfg.K,
+        num_classes=num_classes,
         seq_len=cfg.seq_len,
         patch_len=cfg.x_patch_len,
         stride=cfg.x_stride,
@@ -613,7 +708,7 @@ def run_stage3(all_X, all_Y, pseudo_labels, cfg: PipelineConfig, device: str) ->
     )
 
     center_loss = CenterLoss(
-        num_classes=cfg.K,
+        num_classes=num_classes,
         feat_dim=cfg.x_hidden_dim,
     )
 
@@ -669,6 +764,7 @@ def run_stage3(all_X, all_Y, pseudo_labels, cfg: PipelineConfig, device: str) ->
         'center_loss_state_dict': center_loss.state_dict(),
         'loss_history': loss_history,
         'features': all_features.cpu(),
+        'num_classes': num_classes,
         'config': cfg,
         'X': all_X,
         'Y': all_Y,
@@ -678,6 +774,7 @@ def run_stage3(all_X, all_Y, pseudo_labels, cfg: PipelineConfig, device: str) ->
         x_encoder,
         cfg,
         _x_encoder_output_path(cfg),
+        num_classes=num_classes,
         center_loss=center_loss,
         loss_history=loss_history,
     )
@@ -749,8 +846,15 @@ def main():
     parser.add_argument('--feature_dim', type=int, default=3, help='仅 dummy')
     parser.add_argument('--T', type=int, default=1000, help='仅 dummy')
     parser.add_argument('--K', type=int, default=defaults.K, help='K-Center 聚类数')
-    parser.add_argument('--kcenter_method', type=str, default=defaults.kcenter_method,
-                        choices=['kcenter'], help='伪标签聚类算法')
+    parser.add_argument('--pseudo_label_method', '--kcenter_method', dest='pseudo_label_method',
+                        type=str, default=defaults.pseudo_label_method,
+                        choices=['kcenter', 'dbscan'], help='伪标签聚类算法')
+    parser.add_argument('--dbscan_eps', type=float, default=defaults.dbscan_eps,
+                        help='DBSCAN 邻域半径阈值')
+    parser.add_argument('--dbscan_min_samples', type=int, default=defaults.dbscan_min_samples,
+                        help='DBSCAN core point 的最小邻域样本数')
+    parser.add_argument('--dbscan_chunk_size', type=int, default=defaults.dbscan_chunk_size,
+                        help='DBSCAN GPU 分块距离计算大小')
     parser.add_argument('--n_clusters', type=int, default=defaults.n_clusters, help='谱聚类簇数')
     parser.add_argument('--n_prototypes', type=int, default=defaults.n_prototypes, help='提取典型样本数')
     parser.add_argument('--spectral_sigma', type=float, default=defaults.spectral_sigma,
@@ -787,7 +891,10 @@ def main():
         label_len=args.label_len,
         feature_dim=args.feature_dim,
         K=args.K,
-        kcenter_method=args.kcenter_method,
+        pseudo_label_method=args.pseudo_label_method,
+        dbscan_eps=args.dbscan_eps,
+        dbscan_min_samples=args.dbscan_min_samples,
+        dbscan_chunk_size=args.dbscan_chunk_size,
         n_clusters=args.n_clusters,
         n_prototypes=args.n_prototypes,
         spectral_sigma=args.spectral_sigma,
@@ -833,7 +940,7 @@ def main():
         _assert_cfg_matches(
             cfg,
             saved_cfg,
-            ['dataset', 'seq_len', 'pre_len', 'K', 'kcenter_method'],
+            _stage2_resume_keys(cfg),
             loaded_path,
         )
         print(f"  Loaded Stage 2 artifact from {loaded_path}")
@@ -853,7 +960,7 @@ def main():
         _assert_cfg_matches(
             cfg,
             saved_cfg,
-            ['dataset', 'seq_len', 'pre_len', 'K', 'kcenter_method'],
+            _stage2_resume_keys(cfg),
             loaded_path,
         )
         cfg.feature_dim = all_X.shape[-1]
