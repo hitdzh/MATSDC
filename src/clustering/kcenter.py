@@ -7,6 +7,7 @@ K-Center 聚类：
 import numpy as np
 import torch
 from scipy.spatial.distance import cdist
+from torch.utils.data import DataLoader, TensorDataset
 
 
 def greedy_kcenter(
@@ -115,16 +116,32 @@ def generate_pseudo_labels(
     encoder: torch.nn.Module,
     K: int,
     method: str = 'greedy',
+    batch_size: int | None = None,
+    num_workers: int = 0,
     **kwargs,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Y-PreEncoder 编码 Y, 然后通过 K-Center 聚类生成伪标签
     """
-    # 编码所有 Y 到高维特征空间
+    # 分 batch 编码 Y，避免把全量窗口一次性搬到 GPU。
     encoder.eval()
+    device = next(encoder.parameters()).device
+    dataset = TensorDataset(Y_data)
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size or len(dataset),
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=device.type == 'cuda',
+    )
+
+    feature_chunks = []
     with torch.no_grad():
-        features = encoder(Y_data)  # (N, hidden_dim)
-    features_np = features.cpu().numpy()
+        for batch in loader:
+            batch_y = batch[0].to(device, non_blocking=device.type == 'cuda')
+            features = encoder(batch_y)
+            feature_chunks.append(features.cpu())
+    features_np = torch.cat(feature_chunks, dim=0).numpy()
 
     # 选择 K-Center 方法
     if method == 'robust':

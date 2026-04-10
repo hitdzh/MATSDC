@@ -19,14 +19,14 @@ fi
 dataset=weather
 seq_len=336
 feature_dim=21
-K=10
-n_clusters=8
-n_prototypes=8
+K=16
+n_clusters=16
+n_prototypes=2000
 epochs=100
-batch_size=256
+batch_size=1024
 pretrain_epochs=100
 pretrain_lr=0.001
-pretrain_batch_size=256
+pretrain_batch_size=1024
 
 for pred_len in 96 192; do
     python -u scripts/run_full_pipeline.py \

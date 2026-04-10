@@ -62,11 +62,14 @@ class PipelineConfig:
     # ==================== 训练参数 ====================
     epochs: int = 2                  # 阶段3 训练轮数
     batch_size: int = 32             # 批大小
-    lr_encoder: float = 1e-3         # X-Encoder 学习率 (Adam)
-    lr_centers: float = 0.5          # Center Loss 中心点学习率 (SGD)
-    center_loss_weight: float = 1.0  # Center Loss 权重 λ₁ (联合 Loss: CE + λ₁ * CenterLoss + λ₂ * SupConLoss)
+    num_workers: int | None = None   # DataLoader 工作进程数；None 时自动推断
+    lr_encoder: float = 1e-4         # X-Encoder 学习率 (Adam)
+    lr_centers: float = 0.01         # Center Loss 中心点学习率 (SGD)
+    center_loss_weight: float = 0.1  # Center Loss 权重 λ₁ (联合 Loss: CE + λ₁ * CenterLoss + λ₂ * SupConLoss)
     supcon_loss_weight: float = 0.1  # Supervised Contrastive Loss 权重 λ₂
     supcon_temperature: float = 0.07 # SupCon 温度参数
+    min_lr: float = 1e-5             # CosineAnnealing 最小学习率
+    max_grad_norm: float = 1.0       # 梯度裁剪阈值
 
     # ==================== Y-Encoder 预训练参数 ====================
     pretrain_epochs: int = 5         # Y-Encoder 预训练轮数

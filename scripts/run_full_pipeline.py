@@ -3,7 +3,7 @@
 
 按顺序执行所有 4 个阶段：
   阶段 1: 数据准备 → 切分滑动窗口 (X, Y)
-  阶段 2: Y-PreEnocder + K-Center 聚类
+  阶段 2: Y-PreEncoder + 聚类伪标签生成
   阶段 3: X 空间度量学习 → CE + Center Loss 联合训练
   阶段 4: 谱聚类 + 典型样本提取
 
@@ -16,6 +16,7 @@
 import sys
 import os
 import argparse
+from contextlib import nullcontext
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
@@ -23,7 +24,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset, Subset, WeightedRandomSampler
 
 from configs.default import PipelineConfig
 from src.data.sliding_window import SlidingWindowDataset
@@ -37,6 +38,197 @@ from src.trainers.metric_trainer import MetricTrainer
 from src.clustering.spectral_selector import SpectralSelector
 
 
+def _build_window_tensors(
+    series_np: np.ndarray,
+    seq_len: int,
+    pre_len: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    直接从完整时序构建滑窗视图，避免 DataLoader + cat 的高开销拷贝。
+    """
+    series_t = torch.from_numpy(series_np)
+    window_len = seq_len + pre_len
+    windows = series_t.unfold(0, window_len, 1).permute(0, 2, 1)
+    all_X = windows[:, :seq_len, :]
+    all_Y = windows[:, seq_len:, :]
+    return all_X, all_Y
+
+
+def _encode_in_batches(
+    encoder: nn.Module,
+    data: torch.Tensor,
+    batch_size: int,
+    device: str,
+    num_workers: int | None = None,
+) -> torch.Tensor:
+    """
+    分 batch 提取特征，避免全量张量一次性占满显存。
+    """
+    loader = DataLoader(
+        TensorDataset(data),
+        batch_size=batch_size,
+        shuffle=False,
+        **_make_loader_kwargs(device, num_workers=num_workers),
+    )
+
+    feature_chunks = []
+    with torch.no_grad():
+        for batch in loader:
+            x = batch[0].to(device, non_blocking=device == 'cuda')
+            feature_chunks.append(encoder.encode(x).cpu())
+
+    return torch.cat(feature_chunks, dim=0)
+
+
+def _make_loader_kwargs(device: str, num_workers: int | None = None) -> dict:
+    """
+    为大张量 batch 构建更稳妥的 DataLoader 参数。
+    """
+    if num_workers is None:
+        cpu_count = os.cpu_count() or 1
+        num_workers = min(4, max(0, cpu_count // 4))
+
+    if device != 'cuda':
+        return {'num_workers': num_workers}
+
+    kwargs = {
+        'num_workers': num_workers,
+        'pin_memory': True,
+    }
+    if num_workers > 0:
+        kwargs['persistent_workers'] = True
+        kwargs['prefetch_factor'] = 2
+    return kwargs
+
+
+def _get_amp_context(device: str):
+    """
+    为 CUDA 训练提供自动混合精度上下文，减轻激活与带宽压力。
+    """
+    if device != 'cuda':
+        return nullcontext, False, None
+
+    supports_bf16 = hasattr(torch.cuda, 'is_bf16_supported') and torch.cuda.is_bf16_supported()
+    amp_dtype = torch.bfloat16 if supports_bf16 else torch.float16
+
+    def _autocast():
+        if hasattr(torch, 'autocast'):
+            return torch.autocast(device_type='cuda', dtype=amp_dtype)
+        return torch.cuda.amp.autocast(dtype=amp_dtype)
+
+    return _autocast, True, amp_dtype
+
+
+def _extract_patchtst_encoder_config(encoder: PatchTSTFeatureExtractor, seq_len: int) -> dict:
+    """
+    导出 PatchTSTFeatureExtractor 的最小可复现配置。
+    """
+    first_layer = encoder.transformer_encoder.encoder.layers[0]
+    return {
+        'c_in': encoder.c_in,
+        'seq_len': seq_len,
+        'patch_len': encoder.patch_len,
+        'stride': encoder.stride,
+        'd_model': encoder.patch_projection.out_features,
+        'n_heads': first_layer.self_attn.num_heads,
+        'e_layers': len(encoder.transformer_encoder.encoder.layers),
+        'd_ff': first_layer.linear1.out_features,
+        'aggregation': encoder.aggregation,
+        'concat_rev_params': encoder.concat_rev_params,
+        'output_dim': encoder.get_output_dim(),
+    }
+
+
+def _save_y_encoder(encoder: PatchTSTFeatureExtractor, cfg: PipelineConfig, save_dir: str) -> str:
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir, f'{cfg.dataset}_y_encoder.pt')
+    torch.save({
+        'encoder_state_dict': encoder.state_dict(),
+        'encoder_config': _extract_patchtst_encoder_config(encoder, cfg.pre_len),
+        'training_info': {
+            'dataset': cfg.dataset,
+            'seq_len': cfg.seq_len,
+            'pre_len': cfg.pre_len,
+            'pretrain_epochs': cfg.pretrain_epochs,
+            'pretrain_batch_size': cfg.pretrain_batch_size,
+            'num_workers': cfg.num_workers,
+        },
+    }, save_path)
+    return save_path
+
+
+def _save_x_encoder(
+    encoder: XEncoder,
+    cfg: PipelineConfig,
+    save_dir: str,
+    center_loss: nn.Module | None = None,
+    loss_history=None,
+) -> str:
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir, f'{cfg.dataset}_x_encoder.pt')
+    torch.save({
+        'encoder_state_dict': encoder.state_dict(),
+        'encoder_config': {
+            'feature_dim': cfg.feature_dim,
+            'hidden_dim': cfg.x_hidden_dim,
+            'num_classes': cfg.K,
+            'seq_len': cfg.seq_len,
+            'patch_len': cfg.x_patch_len,
+            'stride': cfg.x_stride,
+            'd_model': cfg.x_d_model,
+            'n_heads': cfg.x_n_heads,
+            'e_layers': cfg.x_e_layers,
+            'd_ff': cfg.x_d_ff,
+            'aggregation': cfg.x_aggregation,
+            'concat_rev_params': cfg.x_concat_rev_params,
+        },
+        'center_loss_state_dict': center_loss.state_dict() if center_loss is not None else None,
+        'loss_history': loss_history,
+        'training_info': {
+            'dataset': cfg.dataset,
+            'epochs': cfg.epochs,
+            'batch_size': cfg.batch_size,
+            'num_workers': cfg.num_workers,
+        },
+    }, save_path)
+    return save_path
+
+
+def _build_stage3_sampling(valid_labels: np.ndarray, num_classes: int, device: str):
+    """
+    为 Stage 3 构建类别均衡采样器与类别权重。
+    """
+    class_counts = np.bincount(valid_labels.astype(np.int64), minlength=num_classes)
+    safe_class_counts = np.where(class_counts > 0, class_counts, 1)
+
+    sample_weights = 1.0 / safe_class_counts[valid_labels.astype(np.int64)]
+    sampler = WeightedRandomSampler(
+        weights=torch.as_tensor(sample_weights, dtype=torch.double),
+        num_samples=len(sample_weights),
+        replacement=True,
+    )
+
+    class_weights = np.zeros(num_classes, dtype=np.float32)
+    present_mask = class_counts > 0
+    class_weights[present_mask] = 1.0 / class_counts[present_mask]
+    if present_mask.any():
+        class_weights[present_mask] = (
+            class_weights[present_mask]
+            / class_weights[present_mask].sum()
+            * present_mask.sum()
+        )
+
+    return sampler, torch.tensor(class_weights, dtype=torch.float32, device=device), class_counts
+
+
+def _ensure_cfg_defaults(cfg: PipelineConfig) -> PipelineConfig:
+    defaults = PipelineConfig()
+    for key, value in defaults.__dict__.items():
+        if not hasattr(cfg, key):
+            setattr(cfg, key, value)
+    return cfg
+
+
 def run_stage1(cfg: PipelineConfig, args) -> tuple[torch.Tensor, torch.Tensor]:
     """阶段 1"""
     print(f"[Stage 1] Data Preparation — dataset={cfg.dataset}")
@@ -45,6 +237,7 @@ def run_stage1(cfg: PipelineConfig, args) -> tuple[torch.Tensor, torch.Tensor]:
         np.random.seed(42)
         time_series = np.random.randn(args.T, cfg.feature_dim).astype(np.float32)
         dataset = SlidingWindowDataset(time_series, cfg.seq_len, cfg.pre_len)
+        full_series = dataset.time_series
     else:
         dataset = TimeSeriesForecastDataset(
             dataset_name=cfg.dataset,
@@ -53,15 +246,22 @@ def run_stage1(cfg: PipelineConfig, args) -> tuple[torch.Tensor, torch.Tensor]:
             pre_len=cfg.pre_len,
         )
         cfg.feature_dim = dataset.feature_dim
+        full_series = dataset.get_full_series()
 
-    dataloader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=False)
+    n_samples = len(dataset)
+    bytes_per_value = np.dtype(np.float32).itemsize
+    x_gib = (
+        n_samples * cfg.seq_len * cfg.feature_dim * bytes_per_value / 1024 ** 3
+    )
+    y_gib = (
+        n_samples * cfg.pre_len * cfg.feature_dim * bytes_per_value / 1024 ** 3
+    )
+    print(
+        f"  Window build plan: samples={n_samples}, "
+        f"estimated X={x_gib:.2f} GiB, Y={y_gib:.2f} GiB"
+    )
 
-    all_X, all_Y = [], []
-    for X_batch, Y_batch in dataloader:
-        all_X.append(X_batch)
-        all_Y.append(Y_batch)
-    all_X = torch.cat(all_X, dim=0)
-    all_Y = torch.cat(all_Y, dim=0)
+    all_X, all_Y = _build_window_tensors(full_series, cfg.seq_len, cfg.pre_len)
 
     print(f"  X shape: {all_X.shape}")
     print(f"  Y shape: {all_Y.shape}")
@@ -76,7 +276,7 @@ def run_stage1(cfg: PipelineConfig, args) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 class _ReconDecoder(nn.Module):
-    """线性解码器：特征向量 → 重建原始时序窗口"""
+    """线性解码器"""
     def __init__(self, feat_dim, seq_len, c_in):
         super().__init__()
         self.seq_len = seq_len
@@ -92,7 +292,7 @@ class _ReconDecoder(nn.Module):
         return self.net(features).reshape(B, self.seq_len, self.c_in)
 
 
-def _pretrain_on_y(encoder, Y_data, epochs, batch_size, lr, train_ratio, device):
+def _pretrain_on_y(encoder, Y_data, epochs, batch_size, lr, train_ratio, device, num_workers=None):
     """自监督重建训练编码器。"""
     feat_dim = encoder.get_output_dim()
     seq_len = Y_data.size(1)
@@ -105,25 +305,63 @@ def _pretrain_on_y(encoder, Y_data, epochs, batch_size, lr, train_ratio, device)
     # 自监督处理
     N = Y_data.size(0)
     n_train = int(N * train_ratio)
-    # 打乱重排
     idx = torch.randperm(N)
-    Y_shuf = Y_data[idx]
+    train_indices = idx[:n_train].tolist()
+    val_indices = idx[n_train:].tolist()
 
-    train_loader = DataLoader(TensorDataset(Y_shuf[:n_train]), batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(TensorDataset(Y_shuf[n_train:]), batch_size=batch_size)
+    base_dataset = TensorDataset(Y_data)
+    loader_kwargs = _make_loader_kwargs(device, num_workers=num_workers)
+    train_loader = DataLoader(
+        Subset(base_dataset, train_indices),
+        batch_size=batch_size,
+        shuffle=True,
+        **loader_kwargs,
+    )
+    val_loader = DataLoader(
+        Subset(base_dataset, val_indices),
+        batch_size=batch_size,
+        shuffle=False,
+        **loader_kwargs,
+    )
+    autocast_context, amp_enabled, amp_dtype = _get_amp_context(device)
+    if device == 'cuda':
+        if hasattr(torch, 'amp') and hasattr(torch.amp, 'GradScaler'):
+            scaler = torch.amp.GradScaler('cuda', enabled=amp_enabled)
+        else:
+            scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
+    else:
+        scaler = None
 
     print(f"\nTraining encoder ({epochs} epochs, train={n_train})")
+    print(
+        f"  Loader: batch_size={batch_size}, train_batches={len(train_loader)}, "
+        f"val_batches={len(val_loader)}, workers={loader_kwargs.get('num_workers', 0)}, "
+        f"pin_memory={loader_kwargs.get('pin_memory', False)}"
+    )
+    if amp_enabled:
+        print(f"  AMP enabled on CUDA ({amp_dtype})")
 
     best_val = float('inf')
     best_state = None
     for epoch in range(epochs):
         encoder.train(); decoder.train()
         t_loss, n = 0.0, 0
-        for b in train_loader:
-            x = b[0].to(device)
-            recon = decoder(encoder(x))
-            loss = criterion(recon, x)
-            optimizer.zero_grad(); loss.backward(); optimizer.step()
+        for batch_idx, b in enumerate(train_loader, start=1):
+            x = b[0].to(device, non_blocking=amp_enabled)
+
+            optimizer.zero_grad(set_to_none=True)
+            with autocast_context():
+                recon = decoder(encoder(x))
+                loss = criterion(recon, x)
+
+            if amp_enabled:
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
+                
             t_loss += loss.item(); n += 1
         t_loss /= max(n, 1)
 
@@ -131,9 +369,11 @@ def _pretrain_on_y(encoder, Y_data, epochs, batch_size, lr, train_ratio, device)
         v_loss, n = 0.0, 0
         with torch.no_grad():
             for b in val_loader:
-                x = b[0].to(device)
-                recon = decoder(encoder(x))
-                v_loss += criterion(recon, x).item(); n += 1
+                x = b[0].to(device, non_blocking=amp_enabled)
+                with autocast_context():
+                    recon = decoder(encoder(x))
+                    loss = criterion(recon, x)
+                v_loss += loss.item(); n += 1
         v_loss /= max(n, 1)
 
         mark = ''
@@ -181,8 +421,16 @@ def _build_y_encoder(cfg, device, pretrained_path=None, Y_data=None):
         dropout=0.1, activation='gelu',
         aggregation='max', concat_rev_params=True,
     ).to(device)
-    return _pretrain_on_y(encoder, Y_data, cfg.pretrain_epochs, cfg.pretrain_batch_size,
-                          cfg.pretrain_lr, 0.8, device)
+    return _pretrain_on_y(
+        encoder,
+        Y_data,
+        cfg.pretrain_epochs,
+        cfg.pretrain_batch_size,
+        cfg.pretrain_lr,
+        0.8,
+        device,
+        cfg.num_workers,
+    )
 
 
 def run_stage2(all_X, all_Y, cfg, device, pretrained_encoder=None) -> np.ndarray:
@@ -192,10 +440,12 @@ def run_stage2(all_X, all_Y, cfg, device, pretrained_encoder=None) -> np.ndarray
     y_encoder = _build_y_encoder(cfg, device, pretrained_encoder, Y_data=all_Y)
 
     pseudo_labels, centers_idx = generate_pseudo_labels(
-        Y_data=all_Y.to(device),
+        Y_data=all_Y,
         encoder=y_encoder,
         K=cfg.K,
         method=cfg.kcenter_method,
+        batch_size=cfg.pretrain_batch_size,
+        num_workers=cfg.num_workers or 0,
     )
 
     label_dist = [int((pseudo_labels == k).sum()) for k in range(cfg.K)]
@@ -209,6 +459,8 @@ def run_stage2(all_X, all_Y, cfg, device, pretrained_encoder=None) -> np.ndarray
     os.makedirs('outputs/stage2', exist_ok=True)
     torch.save({'pseudo_labels': pseudo_labels, 'centers_idx': centers_idx, 'config': cfg},
                'outputs/stage2/pseudo_labels.pt')
+    y_encoder_path = _save_y_encoder(y_encoder, cfg, 'outputs/Y_Encoder')
+    print(f"  Saved Y-Encoder to {y_encoder_path}")
 
     return pseudo_labels
 
@@ -217,10 +469,15 @@ def run_stage3(all_X, all_Y, pseudo_labels, cfg: PipelineConfig, device: str) ->
     """阶段 3"""
     print(f"\n[Stage 3] X-Encoder Metric Learning Training")
 
-    # 过滤异常值
+    # 过滤异常值，仅保留有效伪标签样本参与 Stage 3 训练
     valid_mask = pseudo_labels >= 0
     valid_X = all_X[valid_mask]
     valid_labels = pseudo_labels[valid_mask]
+    if valid_labels.size == 0:
+        raise ValueError("Stage 3 received no valid pseudo labels; all labels are -1.")
+    sampler, class_weights, class_counts = _build_stage3_sampling(valid_labels, cfg.K, device)
+    print(f"  Valid samples: {valid_X.shape[0]} / {all_X.shape[0]}")
+    print(f"  Class counts: {class_counts.tolist()}")
 
     # 构建模型 (PatchTST backbone)
     x_encoder = XEncoder(
@@ -255,12 +512,21 @@ def run_stage3(all_X, all_Y, pseudo_labels, cfg: PipelineConfig, device: str) ->
         lr_centers=cfg.lr_centers,
         center_loss_weight=cfg.center_loss_weight,
         supcon_loss_weight=cfg.supcon_loss_weight,
+        class_weights=class_weights,
+        min_lr=cfg.min_lr,
+        max_grad_norm=cfg.max_grad_norm,
         device=device,
     )
 
     # 训练
-    train_dataset = TensorDataset(valid_X)
-    train_loader = DataLoader(train_dataset, batch_size=cfg.batch_size, shuffle=True)
+    train_labels = torch.from_numpy(valid_labels).long()
+    train_dataset = TensorDataset(valid_X, train_labels)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=cfg.batch_size,
+        sampler=sampler,
+        **_make_loader_kwargs(device, num_workers=cfg.num_workers),
+    )
 
     loss_history = trainer.fit(
         dataloader=train_loader,
@@ -270,8 +536,14 @@ def run_stage3(all_X, all_Y, pseudo_labels, cfg: PipelineConfig, device: str) ->
 
     # 提取全量特征
     x_encoder.eval()
-    with torch.no_grad():
-        all_features = x_encoder.encode(all_X.to(device))
+    print(f"  Extracting X features in batches: batch_size={cfg.batch_size}")
+    all_features = _encode_in_batches(
+        encoder=x_encoder,
+        data=all_X,
+        batch_size=cfg.batch_size,
+        device=device,
+        num_workers=cfg.num_workers,
+    )
 
     # 保存
     os.makedirs('outputs/stage3', exist_ok=True)
@@ -284,6 +556,14 @@ def run_stage3(all_X, all_Y, pseudo_labels, cfg: PipelineConfig, device: str) ->
         'X': all_X,
         'Y': all_Y,
     }, 'outputs/stage3/trained_encoder.pt')
+    x_encoder_path = _save_x_encoder(
+        x_encoder,
+        cfg,
+        'outputs/X_Encoder',
+        center_loss=center_loss,
+        loss_history=loss_history,
+    )
+    print(f"  Saved X-Encoder to {x_encoder_path}")
 
     return all_features
 
@@ -347,6 +627,8 @@ def main():
     parser.add_argument('--n_prototypes', type=int, default=4, help='提取典型样本数')
     parser.add_argument('--epochs', type=int, default=2, help='训练轮数')
     parser.add_argument('--batch_size', type=int, default=32)
+    parser.add_argument('--num_workers', type=int, default=None,
+                        help='DataLoader 工作进程数；不指定则自动推断')
     parser.add_argument('--pretrain_epochs', type=int, default=5, help='Y-Encoder 预训练轮数')
     parser.add_argument('--pretrain_lr', type=float, default=1e-3, help='Y-Encoder 预训练学习率')
     parser.add_argument('--pretrain_batch_size', type=int, default=64, help='Y-Encoder 预训练批大小')
@@ -370,10 +652,12 @@ def main():
         n_prototypes=args.n_prototypes,
         epochs=args.epochs,
         batch_size=args.batch_size,
+        num_workers=args.num_workers,
         pretrain_epochs=args.pretrain_epochs,
         pretrain_lr=args.pretrain_lr,
         pretrain_batch_size=args.pretrain_batch_size,
     )
+    cfg = _ensure_cfg_defaults(cfg)
 
     # ===== 阶段 1 =====
     if args.resume_from <= 1:
@@ -382,7 +666,7 @@ def main():
         print(f"\n[Stage 1] Skipped (resume_from={args.resume_from})")
         data = torch.load(f'outputs/stage1/{cfg.dataset}_data.pt', weights_only=False)
         all_X, all_Y = data['X'], data['Y']
-        cfg = data['config']
+        cfg = _ensure_cfg_defaults(data['config'])
 
     # ===== 阶段 2 =====
     if args.resume_from <= 2:
@@ -392,7 +676,7 @@ def main():
         print(f"\n[Stage 2] Skipped (resume_from={args.resume_from})")
         data = torch.load('outputs/stage2/pseudo_labels.pt', weights_only=False)
         pseudo_labels = data['pseudo_labels']
-        cfg = data['config']
+        cfg = _ensure_cfg_defaults(data['config'])
 
     # ===== 阶段 3 =====
     if args.resume_from <= 3:
@@ -402,7 +686,7 @@ def main():
         data = torch.load('outputs/stage3/trained_encoder.pt', weights_only=False)
         all_features = data['features']
         all_X, all_Y = data['X'], data['Y']
-        cfg = data['config']
+        cfg = _ensure_cfg_defaults(data['config'])
 
     # ===== 阶段 4 =====
     prototypes = run_stage4(all_X, all_Y, all_features, cfg)

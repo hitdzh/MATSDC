@@ -19,14 +19,14 @@ fi
 dataset=electricity
 seq_len=336
 feature_dim=321
-K=16
-n_clusters=12
-n_prototypes=12
+K=16                    # 对 Y 分类类别数 
+n_clusters=16           # 谱聚类簇数
+n_prototypes=2000       # 浓缩数据集数据点个数
 epochs=100
-batch_size=128
+batch_size=512
 pretrain_epochs=60
 pretrain_lr=0.001
-pretrain_batch_size=128
+pretrain_batch_size=512
 
 for pred_len in 96 192; do
     python -u scripts/run_full_pipeline.py \
